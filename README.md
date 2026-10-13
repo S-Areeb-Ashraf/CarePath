@@ -83,27 +83,6 @@ cd backend
 copy .env.example .env
 ```
 
-On macOS/Linux: `cp .env.example .env`.
-
-Edit `.env` and replace every `replace-me` value. At minimum you need:
-
-- Supabase project URL and service role key (server-side only)
-- LLM API key, base URL, and model names
-- Embedding base URL and model (RAG will not work without this)
-- `AUTH_SECRET` (a long random string you generate)
-- `ADMIN_API_KEY` (a secret you generate; not a login password)
-- `CORS_ORIGINS=http://localhost:5173` for local Vite
-
-Leave `EMBEDDING_API_KEY` blank to reuse the LLM key when both use the same provider. Raise `LLM_TIMEOUT_SECONDS` (for example `30`) if the model is slow; one patient message can trigger several tool calls.
-
-The full variable list is in `backend/.env.example`. Put secrets only in your local `.env`, never in git. Typical Gemini settings:
-
-- `LLM_BASE_URL=https://generativelanguage.googleapis.com/v1beta/openai/`
-- `LLM_MODEL_PRIMARY=gemini-2.5-flash`
-- `EMBEDDING_MODEL=text-embedding-004`
-
-Other OpenAI-compatible hosts (OpenRouter, Groq, local Ollama, xAI) work by changing `LLM_BASE_URL`, model ids, and keys only. Keep embeddings on a model that matches the index you already built; changing the embedding model requires re-ingest.
-
 ### 3. Install and start the API
 
 ```powershell
@@ -123,21 +102,9 @@ On macOS/Linux activate with `source .venv/bin/activate`.
 
 ```powershell
 cd frontend
-copy .env.example .env
 npm install
 npm run dev
 ```
-
-On macOS/Linux: `cp .env.example .env`.
-
-`frontend/.env.example` only has public Vite values, for example:
-
-```
-VITE_API_BASE_URL=http://localhost:8000
-VITE_CLINIC_TIMEZONE=Asia/Riyadh
-```
-
-Open the URL Vite prints (usually `http://localhost:5173`). Create an account, then use Assistant and My appointments.
 
 ### 5. Tests and evaluation (optional)
 
