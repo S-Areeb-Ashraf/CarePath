@@ -16,7 +16,11 @@ class AppointmentTools:
 
     def check_availability(self, request: AvailabilityRequest) -> ToolResult:
         if timeout := self._timeout('check_availability'): return timeout
-        slots = [slot for slot in self.repo.list_slots(request.specialty, request.date) if slot.status == 'available']
+        now = datetime.now(timezone.utc)
+        # Booked/held slots are excluded (status != 'available'), and slots that
+        # already started today are hidden so only the remaining day is offered.
+        slots = [slot for slot in self.repo.list_slots(request.specialty, request.date)
+                 if slot.status == 'available' and slot.starts_at > now]
         return ToolResult(status='confirmed', tool_name='check_availability', data={'slots':[{'slot_id':s.id,'starts_at_local':format_local(self.settings, s.starts_at),'starts_at':to_local_iso(self.settings, s.starts_at),'specialty':s.specialty} for s in slots]})
 
     def book_appointment(self, request: BookingRequest) -> ToolResult:
@@ -31,7 +35,7 @@ class AppointmentTools:
         appointment_id = self.repo.next_appointment_reference()
         self.repo.save_appointment(Appointment(appointment_id, request.patient_reference, request.specialty, slot.id, slot.starts_at))
         slot.status = 'booked'; self.repo.save_slot(slot); self.repo.save_idempotency_key(request.idempotency_key)
-        return ToolResult(status='confirmed', tool_name='book_appointment', data={'appointment_id':appointment_id,'slot_id':slot.id,'starts_at_local':format_local(self.settings, slot.starts_at),'starts_at':to_local_iso(self.settings, slot.starts_at)})
+        return ToolResult(status='confirmed', tool_name='book_appointment', data={'appointment_id':appointment_id,'slot_id':slot.id,'specialty':slot.specialty,'starts_at_local':format_local(self.settings, slot.starts_at),'starts_at':to_local_iso(self.settings, slot.starts_at)})
 
     def lookup_appointment(self, request: AppointmentLookupRequest) -> ToolResult:
         if timeout := self._timeout('lookup_appointment'): return timeout
@@ -56,12 +60,14 @@ class AppointmentTools:
         if timeout := self._timeout('cancel_appointment'): return timeout
         if self.repo.has_idempotency_key(request.idempotency_key): return ToolResult(status='confirmed', tool_name='cancel_appointment', data={'idempotent_replay':True})
         appointment = self.repo.get_appointment(request.appointment_id)
-        if not appointment or appointment.patient_reference != request.patient_reference or appointment.status in ('cancelled', 'cancellation_pending_approval'): return ToolResult(status='failed', tool_name='cancel_appointment', error_code='APPOINTMENT_NOT_FOUND', message='No active appointment found for this patient.')
-        hours = (appointment.starts_at - datetime.now(timezone.utc)).total_seconds() / 3600
-        if hours <= self.settings.cancellation_auto_approve_hours:
-            appointment.status = 'cancellation_pending_approval'; self.repo.save_appointment(appointment)
-            return ToolResult(status='confirmed', tool_name='cancel_appointment', data={'pending_approval':True,'appointment_id':appointment.id})
-        appointment.status = 'cancelled'; self.repo.save_appointment(appointment); self.repo.save_idempotency_key(request.idempotency_key)
+        if not appointment or appointment.patient_reference != request.patient_reference or appointment.status == 'cancelled': return ToolResult(status='failed', tool_name='cancel_appointment', error_code='APPOINTMENT_NOT_FOUND', message='No active appointment found for this patient.')
+        # The patient explicitly confirmed through the assistant, so the
+        # cancellation always takes effect immediately. The 24h approval
+        # policy is no longer applied.
+        appointment.status = 'cancelled'; self.repo.save_appointment(appointment)
+        slot = self.repo.get_slot(appointment.slot_id)
+        if slot: slot.status = 'available'; self.repo.save_slot(slot)
+        self.repo.save_idempotency_key(request.idempotency_key)
         return ToolResult(status='confirmed', tool_name='cancel_appointment', data={'cancelled':True,'appointment_id':appointment.id})
 
     def escalate_to_human(self, request: EscalationRequest) -> ToolResult:

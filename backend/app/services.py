@@ -6,6 +6,7 @@ the ChromaDB knowledge base. Any OpenAI-compatible provider works — switching
 provider or model is an environment change, not a code change.
 """
 import json
+import re
 from datetime import date as date_type
 from datetime import datetime
 from uuid import uuid4
@@ -14,6 +15,7 @@ from .config import Settings
 from .llm import LLMClient, LLMUnavailable
 from .rag import KnowledgeBase, EmbeddingError
 from .repositories import Repository
+from .session_store import ChatHistoryStore
 from .schemas import (
     AppointmentLookupRequest,
     AssistantRequest,
@@ -44,6 +46,7 @@ class AssistantService:
     def __init__(self, repo: Repository, settings: Settings):
         self.repo = repo
         self.settings = settings
+        self.history = ChatHistoryStore(settings)
         self.tools = AppointmentTools(repo, settings)
         self.llm = LLMClient(settings)
         self.search = SerperSearch(settings)
@@ -52,16 +55,17 @@ class AssistantService:
     # ---------- public entry point ----------
 
     def handle(self, request: AssistantRequest, patient_reference: str) -> AssistantResponse:
-        session_id = request.session_id or uuid4()
+        session_id = uuid4()
         request_id = uuid4()
         self.llm_status = 'not_needed'
         self.llm_error = None
         sources: list[Source] = []
         tool_trace: list[ToolCall] = []
+        tool_results: list[ToolResult] = []
 
         try:
-            history = self._load_history(session_id, request.message, patient_reference)
-            reply, used_tools, used_sources = self._agent_loop(history, patient_reference, tool_trace, sources)
+            history = self._load_history(patient_reference, request.message)
+            reply, used_tools, used_sources = self._agent_loop(history, patient_reference, tool_trace, sources, tool_results)
         except LLMUnavailable as exc:
             self._set_llm_failure(exc)
             return self._response(session_id, request_id, 'The assistant service is temporarily unavailable. Please try again shortly or ask for a human representative.', 'error', 'failed', tool_trace, sources=sources)
@@ -69,12 +73,13 @@ class AssistantService:
             self.llm_error = str(exc)
             return self._response(session_id, request_id, 'Something went wrong while handling your request. Please try again or ask for a human representative.', 'error', 'failed', tool_trace, sources=sources)
 
-        self._save_history(session_id, request, reply)
-        return self._response(session_id, request_id, reply, 'assistant', 'completed', tool_trace, sources=sources)
+        structured = self._build_structured(tool_results, reply)
+        self.history.append(patient_reference, request.message, reply)
+        return self._response(session_id, request_id, reply, 'assistant', 'completed', tool_trace, sources=sources, structured=structured)
 
     # ---------- agent loop ----------
 
-    def _agent_loop(self, history: list[dict], patient_reference: str, tool_trace: list[ToolCall], sources: list[Source]) -> tuple[str, list[ToolCall], list[Source]]:
+    def _agent_loop(self, history: list[dict], patient_reference: str, tool_trace: list[ToolCall], sources: list[Source], tool_results: list[ToolResult] | None = None) -> tuple[str, list[ToolCall], list[Source]]:
         max_iterations = self.settings.agent_max_iterations or MAX_TOOL_ITERATIONS_FALLBACK
         messages = list(history)
         for _ in range(max_iterations):
@@ -86,6 +91,8 @@ class AssistantService:
                 for index, call in enumerate(turn.tool_calls):
                     result = self._execute_tool(call, patient_reference, sources)
                     tool_trace.append(ToolCall(name=result.tool_name, status=result.status, error_code=result.error_code))
+                    if tool_results is not None:
+                        tool_results.append(result)
                     messages.append({'role': 'tool', 'tool_call_id': call.id or f'call_{index}', 'content': json.dumps(result.model_dump(mode='json'), default=str)})
                 continue
             if turn.content:
@@ -175,7 +182,7 @@ class AssistantService:
         appointment_id = str(arguments.get('appointment_id') or '').strip()
         confirmed = bool(arguments.get('confirmed'))
         if not confirmed:
-            return self._tool_error('cancel_appointment', 'CONFIRMATION_REQUIRED', 'The patient must explicitly confirm the cancellation first. Ask them and call again with confirmed=true.')
+            return self._tool_error('cancel_appointment', 'CONFIRMATION_REQUIRED', 'The patient must explicitly confirm the cancellation first. Ask them "Do you really want to cancel appointment <appointment_id>?" and call again with confirmed=true.')
         if not appointment_id:
             return self._tool_error('cancel_appointment', 'MISSING_FIELDS', 'appointment_id is required.')
         return self.tools.cancel_appointment(CancellationRequest(
@@ -231,25 +238,58 @@ class AssistantService:
             return ToolResult(status='failed', tool_name='search_clinic_info', error_code='NO_RESULTS', message='No information found. Tell the patient you do not know and suggest contacting the clinic directly.')
         return ToolResult(status='confirmed', tool_name='search_clinic_info', data=combined)
 
+    # ---------- structured UI payload ----------
+
+    def _build_structured(self, tool_results: list[ToolResult], reply: str) -> dict:
+        """Machine-readable outcome of this turn so the UI can render chips and
+        cards from real tool data instead of guessing from reply text."""
+        slots: list[dict] = []
+        appointments: list[dict] = []
+        specialty = None
+        date_ctx = None
+        outcome = None
+        appointment_id = None
+        kind = 'none'
+        for result in tool_results:
+            data = result.data if isinstance(result.data, dict) else {}
+            if result.status != 'confirmed':
+                if result.error_code and result.error_code != 'CONFIRMATION_REQUIRED':
+                    kind, outcome = 'error', result.message or result.error_code
+                continue
+            if result.tool_name == 'check_availability' and data.get('slots'):
+                kind = 'slots'
+                for slot in data['slots']:
+                    if isinstance(slot, dict) and slot.get('slot_id'):
+                        slots.append({'slot_id': slot['slot_id'], 'starts_at_local': slot.get('starts_at_local') or str(slot.get('starts_at', '')), 'starts_at': slot.get('starts_at')})
+                        specialty = specialty or data.get('specialty') or slot.get('specialty')
+            elif result.tool_name == 'list_my_appointments' and data.get('appointments'):
+                kind = 'appointments'
+                appointments = [
+                    {'appointment_id': item.get('appointment_id'), 'specialty': item.get('specialty'), 'starts_at_local': item.get('starts_at_local'), 'status': item.get('status')}
+                    for item in data['appointments'] if isinstance(item, dict)
+                ]
+            elif result.tool_name == 'book_appointment' and data.get('appointment_id') and not data.get('idempotent_replay'):
+                kind, outcome, appointment_id = 'confirmation', 'booked', data['appointment_id']
+                specialty = specialty or data.get('specialty')
+            elif result.tool_name == 'cancel_appointment' and data.get('cancelled'):
+                kind, outcome, appointment_id = 'confirmation', 'cancelled', data['appointment_id']
+            elif result.tool_name == 'reschedule_appointment' and data.get('appointment_id') and not data.get('idempotent_replay'):
+                kind, outcome, appointment_id = 'confirmation', 'rescheduled', data['appointment_id']
+        # A date mentioned in the reply gives the booking context for slot chips.
+        match = re.search(r'\b(202\d-\d\d-\d\d)\b', reply)
+        if match:
+            date_ctx = match.group(1)
+        return {'kind': kind, 'specialty': specialty, 'date': date_ctx, 'slots': slots, 'appointments': appointments, 'outcome': outcome, 'appointment_id': appointment_id}
+
     # ---------- history persistence ----------
 
-    def _load_history(self, session_id, message: str, patient_reference: str) -> list[dict]:
-        state = self.repo.get_session_state(session_id) or {}
-        turns = state.get('messages', []) if isinstance(state, dict) else []
+    def _load_history(self, patient_reference: str, message: str) -> list[dict]:
+        turns = self.history.get(patient_reference)
         system = {
             'role': 'system',
             'content': SYSTEM_PROMPT + f'\n\nLogged-in patient_reference: {patient_reference}. Today is {datetime.now().date().isoformat()}.',
         }
-        return [system] + turns[-12:] + [{'role': 'user', 'content': message}]
-
-    def _save_history(self, session_id, request: AssistantRequest, reply: str) -> None:
-        state = self.repo.get_session_state(session_id) or {}
-        turns = state.get('messages', []) if isinstance(state, dict) else []
-        turns = turns + [
-            {'role': 'user', 'content': request.message},
-            {'role': 'assistant', 'content': reply},
-        ]
-        self.repo.save_session_state(session_id, {'messages': turns[-12:]})
+        return [system] + turns[-20:] + [{'role': 'user', 'content': message}]
 
     # ---------- helpers ----------
 
@@ -258,7 +298,7 @@ class AssistantService:
         self.llm_status = 'not_configured' if ('not configured' in text or 'required' in text) else 'failed'
         self.llm_error = text
 
-    def _response(self, session_id, request_id, reply: str, intent: str, status: str, calls: list[ToolCall] | None = None, human: bool = False, sources: list[Source] | None = None) -> AssistantResponse:
+    def _response(self, session_id, request_id, reply: str, intent: str, status: str, calls: list[ToolCall] | None = None, human: bool = False, sources: list[Source] | None = None, structured: dict | None = None) -> AssistantResponse:
         return AssistantResponse(
             session_id=session_id,
             request_id=request_id,
@@ -268,6 +308,7 @@ class AssistantService:
             tool_calls=calls or [],
             requires_human=human,
             sources=sources or [],
+            structured=structured or {},
             llm_used=self.llm_status == 'used',
             llm_status=self.llm_status,
             llm_error=getattr(self, 'llm_error', None),

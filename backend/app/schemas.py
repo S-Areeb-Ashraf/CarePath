@@ -31,6 +31,14 @@ class AssistantResponse(BaseModel):
     llm_used: bool = False
     llm_status: Literal['used','not_configured','failed','not_needed'] = 'not_needed'
     llm_error: str | None = None
+    # Structured, machine-readable outcome of the last turn so the UI renders
+    # chips/cards from real data instead of guessing from reply text.
+    # shape: {"kind": "slots"|"appointments"|"confirmation"|"error"|"none",
+    #         "specialty": str|None, "date": str|None,
+    #         "slots": [{slot_id, starts_at_local, starts_at}],
+    #         "appointments": [{appointment_id, specialty, starts_at_local, status}],
+    #         "outcome": str|None, "appointment_id": str|None}
+    structured: dict[str, Any] = {}
 
 class CostRequest(BaseModel):
     interactions: int = Field(default=100000, ge=1)

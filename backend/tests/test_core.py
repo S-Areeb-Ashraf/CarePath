@@ -23,8 +23,10 @@ def test_booking_is_idempotent_and_confirmed():
     assert first.status == 'confirmed'
     assert second.data['idempotent_replay'] is True
 
-def test_cancellation_within_window_is_pending_approval():
+def test_cancellation_within_window_still_cancels():
     settings = Settings(app_env='test', supabase_url='x', supabase_service_role_key='x', llm_api_key='x', llm_model_primary='x', llm_model_secondary='y', cors_origins=['http://test'], admin_api_key='x')
-    result = AppointmentTools(Repository.seeded(), settings).cancel_appointment(CancellationRequest(appointment_id='APT-SOON', patient_reference='PAT-001', idempotency_key='cancel-key-1'))
+    repo = Repository.seeded(); tools = AppointmentTools(repo, settings)
+    result = tools.cancel_appointment(CancellationRequest(appointment_id='APT-SOON', patient_reference='PAT-001', idempotency_key='cancel-key-1'))
     assert result.status == 'confirmed'
-    assert result.data['pending_approval'] is True
+    assert result.data['cancelled'] is True
+    assert tools.repo.get_appointment('APT-SOON').status == 'cancelled'

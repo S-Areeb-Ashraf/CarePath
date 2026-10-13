@@ -19,6 +19,7 @@ from .schemas import (
     ToolResult,
 )
 from .services import AssistantService
+from .session_store import ChatHistoryStore
 from .tools import AppointmentTools
 from .llm import LLMClient
 from . import auth as auth_utils
@@ -125,6 +126,20 @@ def cancel_appointment(request: CancellationRequest) -> ToolResult:
     return tools.cancel_appointment(request)
 
 
+@app.post('/chat/clear', response_model=dict)
+def clear_chat(patient: PatientProfile = Depends(current_patient)) -> dict:
+    """Clear ONLY this patient's chat history. Appointments and slots are untouched."""
+    ChatHistoryStore(settings).clear(patient.patient_reference)
+    return {'cleared': True}
+
+
+@app.get('/chat/history')
+def chat_history(patient: PatientProfile = Depends(current_patient)) -> dict:
+    """Restore the patient's saved chat so it survives sign-out / sign-in."""
+    messages = ChatHistoryStore(settings).get(patient.patient_reference)
+    return {'messages': messages}
+
+
 @app.post('/tools/lookup-appointment', response_model=ToolResult)
 def lookup_appointment(request: AppointmentLookupRequest) -> ToolResult:
     return tools.lookup_appointment(request)
@@ -142,7 +157,24 @@ def overview() -> dict:
 
 @app.get('/content/knowledge')
 def knowledge() -> dict:
-    return {'documents': repo.client.table('kb_documents').select('id,source,title,version,effective_date,requires_validation').order('title').execute().data or []}
+    # Verified official Saudi links, matched by source slug so each card in the
+    # Knowledge base page can link to the authority page it came from.
+    verified_links = {
+        'saudi/chi-insured-rights': 'https://www.chi.gov.sa/en/beneficiary/Resolutions%20and%20Circulars/Health%20Insurance%20beneficiaries%27%20right.pdf',
+        'saudi/chi-benefit-package': 'https://www.chi.gov.sa/en/beneficiary/healthinsurancepolicy/Updated%20Essential%20Benefit%20Package%20%20(%20effective%201%20October%202022).pdf',
+        'saudi/chi-emergency-insurance': 'https://www.chi.gov.sa/en/beneficiary/healthinsurancepolicy/Updated%20Essential%20Benefit%20Package%20%20(%20effective%201%20October%202022).pdf',
+        'saudi/moh-patient-safety': 'https://www.moh.gov.sa/en/HealthAwareness/EducationalContent/HealthTips/Documents/Patient-Bill-of-Rights-and-Responsibilities.pdf',
+        'saudi/moh-imaging-fasting': 'https://www.moh.gov.sa/en/Ministry/MediaCenter/Publications/Documents/Protocols-of-CM.pdf',
+        'saudi/moh-sehhaty-appointments': 'https://www.moh.gov.sa/en/eservices/sehhaty/pages/appointment-booking-on-sehhaty.aspx',
+        'policy/cancellation': 'https://www.moh.gov.sa/en/HealthAwareness/EducationalContent/HealthTips/Pages/default.aspx',
+        'insurance/faq': 'https://www.chi.gov.sa/en/Pages/default.aspx',
+        'prep/general': 'https://www.moh.gov.sa/en/eservices/pages/personal.aspx',
+    }
+    documents = repo.client.table('kb_documents').select('id,source,title,version,effective_date,requires_validation').order('title').execute().data or []
+    return {'documents': [
+        {**document, 'official_url': verified_links.get(document.get('source', ''))}
+        for document in documents
+    ]}
 
 
 @app.get('/submission')
